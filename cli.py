@@ -9430,19 +9430,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if not renews_display and c and c.cycle_ends_at:
             renews_display = format_renews(c.cycle_ends_at)
 
-        # Status line — dollars-only, no duplicated "of $Y" (the bar carries that).
+        # Status line — dollars-only, with a "→ Plus" echo of a pending change so
+        # the headline itself carries a scheduled downgrade/cancellation.
+        _flip = ""
+        if c and c.cancel_at_period_end:
+            _flip = " → cancels"
+        elif c and c.pending_downgrade_tier_name:
+            _flip = f" → {c.pending_downgrade_tier_name}"
         if not plan_name:
             status = "Plan: Free · free models only"
         elif usage is not None and u_status == "low" and usage.total_spendable_usd is not None:
             _tot = f"${usage.total_spendable_usd:,.2f}"
-            status = f"Plan: {plan_name} · {_tot} left"
+            status = f"Plan: {plan_name}{_flip} · {_tot} left"
         else:
             _spend = getattr(usage, "total_spendable_usd", None) if usage else None
             _left = f" · ${_spend:,.2f} left" if _spend is not None else ""
             _tail = " · view only" if view_only else (f" · renews {renews_display}" if renews_display else "")
-            status = f"Plan: {plan_name}{_left}{_tail}"
+            status = f"Plan: {plan_name}{_flip}{_left}{_tail}"
 
-        print()
+        # Lead with the scheduled change (cancel > downgrade) so it can't read as
+        # "nothing happened" — mirrors the TUI banner. All-`_cprint` (blanks
+        # included) so the block orders deterministically even when piped.
+        _trans = None
+        if c and c.cancel_at_period_end:
+            _when = format_renews(c.cancellation_effective_at) or "the end of the billing period"
+            _trans = ((c.tier_name or "your plan"), "cancels", _when)
+        elif c and c.pending_downgrade_tier_name:
+            _when = format_renews(c.pending_downgrade_at) or "the end of the cycle"
+            _trans = ((c.tier_name or "your plan"), c.pending_downgrade_tier_name, _when)
+        _cprint("")
+        if _trans:
+            _from, _to, _when = _trans
+            _cprint(f"  ⏳ {_b('Scheduled change')}")
+            _cprint(f"  {_from} ──▶ {_to}  {_d('· ' + _when)}")
+            _cprint(f"  {_d(f'You keep {_from} (and its credits) until then.')}")
+            _cprint("")
+
         _cprint(f"  ⚕ {_b(status)}")
         print(f"  {'─' * 41}")
 
@@ -9466,17 +9489,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"  {_d(_org_line)}")
         print(f"  {'─' * 41}")
 
-        # Headline precedence: cancel-scheduled > downgrade-pending.
-        if c and c.cancel_at_period_end:
-            _eff = format_renews(c.cancellation_effective_at) if c.cancellation_effective_at else None
-            if _eff:
-                _cprint(f"  {_d(f'Cancels on {_eff} — your plan stays active until then.')}")
-            else:
-                _cprint(f"  {_d('Cancellation scheduled — your plan stays active until the end of the billing period.')}")
-        elif c and c.pending_downgrade_tier_name:
-            _when = format_renews(c.pending_downgrade_at) or "the end of the cycle"
-            _cprint(f"  {_d(f'Scheduled to switch to {c.pending_downgrade_tier_name} on {_when}.')}")
-
+        # ── Actions ── Members (non-admin) and non-interactive contexts fall back
+        # to the portal hand-off; a paid admin/owner gets the full in-terminal
+        # change flow (parity with the TUI overlay).
         if not can_change:
             print()
             _cprint(f"  {_d('Plan changes need an org admin/owner.')}")
@@ -9484,33 +9499,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 print(f"  Manage on portal: {manage_url}")
             return
 
+        if not getattr(self, "_app", None):
+            # Non-interactive (TUI slash-worker / piped): the modal can't run.
+            print()
+            if manage_url:
+                print(f"  Manage your subscription: {manage_url}")
+                print("  Open it in your browser, then re-run /subscription.")
+            return
+
+        if is_free:
+            # Starting a NEW subscription needs a fresh card — deep-link only.
+            self._subscription_open_portal(state, manage_url, verb="Start a subscription")
+            return
+
+        # Paid + admin/owner + interactive → the in-terminal change flow.
+        self._subscription_change_menu(state, manage_url)
+
+    def _subscription_open_portal(self, state, manage_url, *, verb="Manage your subscription"):
+        """Open / copy the manage-subscription URL — the portal hand-off."""
         if not manage_url:
             print()
             _cprint(f"  {_d('No manage URL available — is your portal configured?')}")
             return
-
-        # Non-interactive (TUI slash-worker / piped / no live app): the
-        # prompt_toolkit modal can't run here. Render the text hand-off — the
-        # URL is the affordance, same discipline as _show_billing.
-        if not getattr(self, "_app", None):
-            print()
-            print(f"  Manage your subscription: {manage_url}")
-            print("  Open it in your browser, then re-run /subscription.")
-            return
-
         print()
         choices = [
-            ("open", "Open subscription page", "manage your subscription in the browser"),
+            ("open", verb, "open the subscription page in your browser"),
             ("copy", "Copy link", "copy the manage-subscription URL to your clipboard"),
             ("cancel", "Cancel", "do nothing"),
         ]
-        raw = self._prompt_text_input_modal(
-            title="Manage your subscription",
-            detail="Pick an option to manage your subscription in the browser.",
-            choices=choices,
-        )
+        raw = self._prompt_text_input_modal(title=verb, detail="", choices=choices)
         choice = self._normalize_slash_confirm_choice(raw, choices)
-
         if choice == "open":
             opened = False
             try:
@@ -9520,9 +9538,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except Exception:
                 opened = False
             if not opened:
-                print(f"  Open this URL to change your plan: {manage_url}")
+                print(f"  Open this URL: {manage_url}")
             print()
-            print("  Finish the change in your browser, then re-run /subscription.")
+            print("  Finish in your browser, then re-run /subscription.")
         elif choice == "copy":
             try:
                 self._write_osc52_clipboard(manage_url)
@@ -9530,7 +9548,258 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except Exception:
                 print(f"  Manage URL: {manage_url}")
         else:
+            print("  🟡 Cancelled.")
+
+    def _subscription_change_menu(self, state, manage_url):
+        """The in-terminal change menu for a paid admin/owner (interactive)."""
+        c = state.current
+        has_pending = bool(c and (c.cancel_at_period_end or c.pending_downgrade_tier_name))
+        keep_name = (c.tier_name if c else None) or "your plan"
+        choices = [("change", "Change plan", "upgrade or downgrade in the terminal")]
+        if has_pending:
+            choices.append(("keep", f"Keep {keep_name} (undo the scheduled change)", "cancel the pending change"))
+        else:
+            choices.append(("cancel_sub", "Cancel subscription", "schedule cancellation at period end"))
+        choices.append(("portal", "Manage on portal", "open the billing page in your browser"))
+        choices.append(("cancel", "Close", "do nothing"))
+        raw = self._prompt_text_input_modal(title="Manage your subscription", detail="", choices=choices)
+        choice = self._normalize_slash_confirm_choice(raw, choices)
+        if choice == "change":
+            self._subscription_pick_tier(state)
+        elif choice == "keep":
+            self._subscription_apply(state, ("resume", None))
+        elif choice == "cancel_sub":
+            self._subscription_confirm_cancel(state)
+        elif choice == "portal":
+            self._subscription_open_portal(state, manage_url)
+        else:
             print("  🟡 Cancelled. No plan change.")
+
+    def _subscription_pick_tier(self, state):
+        """Tier picker → preview → confirm (mirrors the TUI picker screen)."""
+        from agent.billing_view import format_money
+
+        c = state.current
+        tiers = tuple(state.tiers or ())
+        cur_order = next((t.tier_order for t in tiers if t.is_current), 0)
+        # Selectable = enabled paid tiers other than current (free/no-sub excluded;
+        # dropping to free is a cancellation, on the change menu). Sorted by price.
+        selectable = sorted(
+            [t for t in tiers if t.is_enabled and not t.is_current and (t.tier_order or 0) > 0],
+            key=lambda t: t.tier_order or 0,
+        )
+        if not selectable:
+            print("  No other plans are available to switch to right now.")
+            return
+        choices = []
+        for t in selectable:
+            direction = "upgrade" if (t.tier_order or 0) > cur_order else "downgrade"
+            choices.append((t.tier_id, f"{t.name} · {format_money(t.dollars_per_month)}/mo · {direction}", f"switch to {t.name}"))
+        choices.append(("cancel", "Back", "do nothing"))
+        raw = self._prompt_text_input_modal(
+            title="Change plan",
+            detail=f"Current: {c.tier_name if c else 'Free'}. Pick a plan to preview the effect.",
+            choices=choices,
+        )
+        choice = self._normalize_slash_confirm_choice(raw, choices)
+        if not choice or choice == "cancel":
+            print("  🟡 Cancelled. No plan change.")
+            return
+        self._subscription_preview_and_confirm(state, choice)
+
+    def _subscription_preview_and_confirm(self, state, tier_id):
+        """Preview the change (chargeless quote), show the effect, then confirm+apply."""
+        from agent.subscription_view import subscription_change_preview_from_payload
+        from hermes_cli.nous_billing import BillingError, BillingScopeRequired, post_subscription_preview
+
+        _cprint(f"  {_d('Checking the change…')}")
+        try:
+            payload = post_subscription_preview(subscription_type_id=tier_id)
+        except BillingScopeRequired:
+            self._subscription_handle_scope_required(state, retry=("preview", tier_id))
+            return
+        except BillingError as exc:
+            self._subscription_render_error(state, exc)
+            return
+        p = subscription_change_preview_from_payload(payload)
+        effect = p.effect
+        target = p.target_tier_name or "the selected plan"
+        print()
+        if effect == "no_op":
+            _cprint(f"  {_d(f'You are already on {target} — nothing to change.')}")
+            return
+        if effect == "blocked":
+            _cprint(f"  🟡 {p.reason or 'That change cannot be made here — manage it on the portal.'}")
+            return
+        if effect == "charge_now":
+            _amt = f"${p.amount_due_now_cents / 100:.2f}" if p.amount_due_now_cents is not None else None
+            _cprint(f"  {_b('Confirm plan change')}  {_d('· charged now')}")
+            if _amt:
+                _cprint(f"  Upgrade to {target}. You will be charged {_amt} now (prorated).")
+            else:
+                _cprint(f"  Upgrade to {target}. You will be charged the prorated amount now.")
+            _cprint(f"  {_d('The card on your subscription will be charged.')}")
+            pay_label = f"Pay {_amt} & upgrade now" if _amt else "Upgrade now (prorated charge)"
+            action = ("upgrade", tier_id)
+        else:  # scheduled
+            _when = p.effective_at[:10] if (p.effective_at and len(p.effective_at) >= 10) else "the end of the billing period"
+            _cprint(f"  {_b('Confirm plan change')}  {_d('· scheduled · not today')}")
+            _cprint(f"  Change to {target} — takes effect {_when}. No charge now; you keep your current plan until then.")
+            pay_label = f"Schedule change to {target}"
+            action = ("schedule", tier_id)
+        if p.monthly_credits_delta:
+            _cprint(f"  {_d(f'Monthly credits change: {p.monthly_credits_delta}.')}")
+        confirm_choices = [
+            ("yes", pay_label, "apply this change"),
+            ("cancel", "Go back", "do not change"),
+        ]
+        raw = self._prompt_text_input_modal(title=pay_label, detail="", choices=confirm_choices)
+        if self._normalize_slash_confirm_choice(raw, confirm_choices) != "yes":
+            print("  🟡 Cancelled. No plan change.")
+            return
+        self._subscription_apply(state, action)
+
+    def _subscription_confirm_cancel(self, state):
+        """Confirm, then schedule a cancellation at period end."""
+        from agent.billing_usage import format_renews
+
+        c = state.current
+        _end = (format_renews(c.cycle_ends_at) if (c and c.cycle_ends_at) else None) or "the end of the billing period"
+        print()
+        _cprint(f"  {_b('Confirm cancellation')}  {_d('· scheduled · not today')}")
+        _cprint(f"  Cancel {(c.tier_name if c else 'your plan')} — it stays active until {_end}, then won't renew.")
+        _cprint(f"  {_d('You keep your remaining credits for this period. You can resume before it ends.')}")
+        confirm_choices = [
+            ("yes", "Cancel subscription", "schedule cancellation at period end"),
+            ("cancel", "Go back", "keep your plan"),
+        ]
+        raw = self._prompt_text_input_modal(title="Cancel subscription?", detail="", choices=confirm_choices)
+        if self._normalize_slash_confirm_choice(raw, confirm_choices) != "yes":
+            print("  🟡 Cancelled. Your plan is unchanged.")
+            return
+        self._subscription_apply(state, ("cancel", None))
+
+    def _subscription_apply(self, state, action, idempotency_key=None):
+        """Run the mutation for `action`, handling the scope step-up + the result.
+
+        `action` is one of ("upgrade", tier_id) / ("schedule", tier_id) /
+        ("cancel", None) / ("resume", None). insufficient_scope routes to the
+        step-up and replays; the upgrade idempotency key is reused across the replay.
+        """
+        from hermes_cli.nous_billing import (
+            BillingError,
+            BillingScopeRequired,
+            delete_subscription_pending_change,
+            post_subscription_upgrade,
+            put_subscription_pending_change,
+        )
+
+        kind, arg = action
+        key = None
+        if kind == "upgrade":
+            from agent.billing_view import new_idempotency_key
+
+            key = idempotency_key or new_idempotency_key()
+        try:
+            if kind == "upgrade":
+                res = post_subscription_upgrade(subscription_type_id=arg, idempotency_key=key) or {}
+                status = res.get("status")
+                name = res.get("targetTierName") or "your new plan"
+                _url = res.get("recoveryUrl")
+                if status == "already_on_tier":
+                    _cprint(f"  {_DIM}✓ You are already on {name}.{_RST}")
+                elif status == "upgraded":
+                    _cprint(f"  {_DIM}✓ Upgraded to {name}. Your new monthly credits land in a moment.{_RST}")
+                elif status == "requires_action":
+                    _cprint("  🟡 This upgrade needs extra verification (3DS). Finish it on the portal.")
+                    if _url:
+                        print(f"  Portal: {_url}")
+                elif status == "payment_failed":
+                    _cprint("  🔴 Your card was declined. Update your payment method on the portal and try again.")
+                    if _url:
+                        print(f"  Portal: {_url}")
+                else:
+                    _cprint("  🟡 The upgrade could not be completed.")
+                return
+            if kind == "schedule":
+                put_subscription_pending_change(subscription_type_id=arg)
+                _cprint(f"  {_DIM}✓ Scheduled — your plan doesn't change today. You keep it until the end of the billing period, then it switches.{_RST}")
+            elif kind == "cancel":
+                put_subscription_pending_change(cancel=True)
+                _cprint(f"  {_DIM}✓ Scheduled — your plan stays active until the end of the billing period, then it cancels. Nothing changes today.{_RST}")
+            elif kind == "resume":
+                delete_subscription_pending_change()
+                _cprint(f"  {_DIM}✓ Undone — you stay on your current plan.{_RST}")
+            _cprint(f"  {_d('Re-run /subscription anytime to review it.')}")
+        except BillingScopeRequired:
+            self._subscription_handle_scope_required(state, retry=action, idempotency_key=key)
+        except BillingError as exc:
+            self._subscription_render_error(state, exc)
+
+    def _subscription_handle_scope_required(self, state, *, retry, idempotency_key=None):
+        """insufficient_scope → grant terminal billing (step-up), then replay `retry`.
+
+        Mirrors _billing_handle_scope_required: the classic CLI calls
+        step_up_nous_billing_scope directly (it opens the browser + blocks), then
+        replays the held preview/mutation so the user never re-runs the command.
+        """
+        print()
+        print("  ! One-time setup")
+        _cprint(f"  {_d('To change your plan from the terminal, enable terminal billing once. It opens your browser to authorize, then your change picks up right here.')}")
+        if not getattr(self, "_app", None):
+            print("  Run `hermes portal` and enable terminal billing, then re-run /subscription.")
+            return
+        confirm_choices = [
+            ("yes", "Enable terminal billing", "open your browser to authorize"),
+            ("no", "Not now", "cancel"),
+        ]
+        raw = self._prompt_text_input_modal(
+            title="Enable terminal billing",
+            detail="Opens your browser to authorize this terminal.",
+            choices=confirm_choices,
+        )
+        if self._normalize_slash_confirm_choice(raw, confirm_choices) != "yes":
+            print("  No change made. Enable terminal billing when you're ready.")
+            return
+        print("  Opening your browser to enable terminal billing…")
+        try:
+            from hermes_cli.auth import step_up_nous_billing_scope
+
+            granted = step_up_nous_billing_scope(open_browser=True)
+        except Exception as exc:
+            print(f"  Couldn't enable terminal billing: {exc}")
+            return
+        if not granted:
+            print("  Couldn't enable terminal billing — an org admin or owner has to approve it for this org.")
+            return
+        _cprint(f"  {_DIM}✓ Terminal billing enabled.{_RST}")
+        # Re-fetch fresh state, then replay the held action.
+        from agent.subscription_view import build_subscription_state
+
+        try:
+            fresh = build_subscription_state()
+        except Exception:
+            fresh = state
+        rkind, rarg = retry
+        if rkind == "preview":
+            self._subscription_preview_and_confirm(fresh, rarg)
+        else:
+            self._subscription_apply(fresh, retry, idempotency_key=idempotency_key)
+
+    def _subscription_render_error(self, state, exc):
+        """Render a subscription BillingError (a lighter _billing_render_charge_error)."""
+        code = getattr(exc, "error", None)
+        msg = str(exc) or "Something went wrong."
+        if code == "insufficient_scope":
+            # Defensive: the flow routes scope to the step-up before reaching here.
+            _cprint("  🟡 Terminal billing isn't enabled. Enable it, then retry.")
+        elif code in ("subscription_mutation_rejected", "preview_rejected"):
+            _cprint(f"  🟡 {msg}")
+        else:
+            _cprint(f"  🔴 {msg}")
+        _url = getattr(exc, "portal_url", None)
+        if _url:
+            print(f"  Portal: {_url}")
 
     # ------------------------------------------------------------------
     # /billing — Phase 2b terminal billing (CLI surface, all 5 screens)
