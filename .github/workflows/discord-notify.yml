@@ -1,0 +1,193 @@
+name: Discord PR Notifier
+
+on:
+  pull_request:
+    types: [opened, closed, reopened, synchronize, review_requested, ready_for_review, converted_to_draft]
+  pull_request_review:
+    types: [submitted]
+  push:
+    branches-ignore: [main, master]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build & Send Discord Notification
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          EVENT="${{ github.event_name }}"
+          REPO="${{ github.repository }}"
+          REPO_URL="https://github.com/${{ github.repository }}"
+          ACTOR="${{ github.actor }}"
+          AVATAR="https://github.com/${ACTOR}.png"
+
+          if [ "$EVENT" = "pull_request" ]; then
+            ACTION="${{ github.event.action }}"
+            PR_NUM="${{ github.event.pull_request.number }}"
+            PR_TITLE="${{ github.event.pull_request.title }}"
+            PR_URL="${{ github.event.pull_request.html_url }}"
+            BRANCH="${{ github.event.pull_request.head.ref }}"
+            BASE="${{ github.event.pull_request.base.ref }}"
+            DRAFT="${{ github.event.pull_request.draft }}"
+
+            case "$ACTION" in
+              opened)
+                EMOJI="🆕"; COLOR=3066993
+                DESC="**${PR_TITLE}**\nBranch: \`${BRANCH}\` → \`${BASE}\`"
+                ;;
+              closed)
+                MERGED="${{ github.event.pull_request.merged }}"
+                if [ "$MERGED" = "true" ]; then
+                  EMOJI="✅"; COLOR=65280
+                  DESC="**${PR_TITLE}** — MERGED"
+                else
+                  EMOJI="❌"; COLOR=15158332
+                  DESC="**${PR_TITLE}** — CLOSED without merge"
+                fi
+                ;;
+              reopened)
+                EMOJI="🔄"; COLOR=3447003
+                DESC="**${PR_TITLE}** — Reopened"
+                ;;
+              synchronize)
+                EMOJI="📝"; COLOR=10181046
+                DESC="**${PR_TITLE}** — New commits pushed to \`${BRANCH}\`"
+                ;;
+              review_requested)
+                EMOJI="👀"; COLOR=15844367
+                REVIEWER="${{ github.event.requested_reviewer.login || github.event.requested_team.name }}"
+                DESC="**${PR_TITLE}** — Review requested from **${REVIEWER}**"
+                ;;
+              ready_for_review)
+                EMOJI="🟢"; COLOR=3066993
+                DESC="**${PR_TITLE}** — Marked ready for review"
+                ;;
+              converted_to_draft)
+                EMOJI="📋"; COLOR=9807270
+                DESC="**${PR_TITLE}** — Converted to draft"
+                ;;
+              *)
+                EMOJI="📌"; COLOR=9807270
+                DESC="**${PR_TITLE}** — ${ACTION}"
+                ;;
+            esac
+
+            DRAFT_TAG=""
+            [ "$DRAFT" = "true" ] && DRAFT_TAG=" \`DRAFT\`"
+
+            TITLE="${EMOJI} PR #${PR_NUM}${DRAFT_TAG}"
+
+            JSON=$(jq -n \
+              --arg title "$TITLE" \
+              --arg desc "$DESC" \
+              --arg url "$PR_URL" \
+              --arg repo "$REPO" \
+              --arg repo_url "$REPO_URL" \
+              --arg actor "$ACTOR" \
+              --arg avatar "$AVATAR" \
+              --argjson color "$COLOR" \
+              '{
+                embeds: [{
+                  title: $title,
+                  description: $desc,
+                  url: $url,
+                  color: $color,
+                  footer: { text: $repo, icon_url: "https://github.githubassets.com/favicons/favicon.png" },
+                  author: { name: $actor, icon_url: $avatar },
+                  timestamp: now | todate
+                }]
+              }')
+
+          elif [ "$EVENT" = "pull_request_review" ]; then
+            STATE="${{ github.event.review.state }}"
+            PR_NUM="${{ github.event.pull_request.number }}"
+            PR_TITLE="${{ github.event.pull_request.title }}"
+            PR_URL="${{ github.event.review.html_url }}"
+            BODY="${{ github.event.review.body }}"
+            REVIEWER="${{ github.event.review.user.login }}"
+
+            case "$STATE" in
+              approved)
+                EMOJI="✅"; COLOR=65280
+                DESC="**${REVIEWER}** approved **${PR_TITLE}**"
+                ;;
+              changes_requested)
+                EMOJI="🔧"; COLOR=15158332
+                DESC="**${REVIEWER}** requested changes on **${PR_TITLE}**"
+                ;;
+              commented)
+                EMOJI="💬"; COLOR=3447003
+                DESC="**${REVIEWER}** commented on **${PR_TITLE}**"
+                ;;
+              *)
+                EMOJI="📝"; COLOR=9807270
+                DESC="**${REVIEWER}** reviewed **${PR_TITLE}**: ${STATE}"
+                ;;
+            esac
+
+            [ -n "$BODY" ] && DESC="${DESC}\n\n> $(echo "$BODY" | head -c 300)"
+
+            TITLE="${EMOJI} PR #${PR_NUM} Review"
+
+            JSON=$(jq -n \
+              --arg title "$TITLE" \
+              --arg desc "$DESC" \
+              --arg url "$PR_URL" \
+              --arg repo "$REPO" \
+              --arg actor "$REVIEWER" \
+              --arg avatar "https://github.com/${REVIEWER}.png" \
+              --argjson color "$COLOR" \
+              '{
+                embeds: [{
+                  title: $title,
+                  description: $desc,
+                  url: $url,
+                  color: $color,
+                  footer: { text: $repo, icon_url: "https://github.githubassets.com/favicons/favicon.png" },
+                  author: { name: $actor, icon_url: $avatar },
+                  timestamp: now | todate
+                }]
+              }')
+
+          elif [ "$EVENT" = "push" ]; then
+            COMMITS="${{ github.event.commits }}"
+            BRANCH="${GITHUB_REF#refs/heads/}"
+            COMPARE="${{ github.event.compare }}"
+            COMMIT_COUNT="${{ github.event.commits }}"
+
+            # Count commits
+            NUM_COMMITS=$(echo "$COMMITS" | jq 'length // 0')
+            [ "$NUM_COMMITS" -eq 0 ] 2>/dev/null && NUM_COMMITS=1
+
+            COMMITS_LIST=$(echo "$COMMITS" | jq -r 'if type == "array" then .[] | "• `\(.id[:7])` \(.message | split("\n")[0])" else "" end' | head -5)
+            [ -z "$COMMITS_LIST" ] && COMMITS_LIST="• Push to \`${BRANCH}\`"
+
+            EMOJI="📦"; COLOR=10181046
+            TITLE="${EMOJI} Push to \`${BRANCH}\`"
+            DESC="**${NUM_COMMITS} commit(s)** pushed by **${ACTOR}**\n\n${COMMITS_LIST}"
+
+            JSON=$(jq -n \
+              --arg title "$TITLE" \
+              --arg desc "$DESC" \
+              --arg url "$COMPARE" \
+              --arg repo "$REPO" \
+              --arg actor "$ACTOR" \
+              --arg avatar "$AVATAR" \
+              --argjson color "$COLOR" \
+              '{
+                embeds: [{
+                  title: $title,
+                  description: $desc,
+                  url: $url,
+                  color: $color,
+                  footer: { text: $repo, icon_url: "https://github.githubassets.com/favicons/favicon.png" },
+                  author: { name: $actor, icon_url: $avatar },
+                  timestamp: now | todate
+                }]
+              }')
+          fi
+
+          echo "$JSON" | curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @-
