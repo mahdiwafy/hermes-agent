@@ -586,7 +586,21 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         try:
             db = _get_db()
             if db is not None:
-                db.end_session(session_id, end_reason)
+                # Don't end sessions the TUI doesn't own. Gateway-originated
+                # sessions (Telegram, Discord, etc.) are resumed in the TUI
+                # for viewing only — the gateway owns their lifecycle. If
+                # ws_orphan_reap ends them in state.db, the gateway's
+                # SessionStore still routes to the ended session, causing a
+                # Groundhog Day loop on every subsequent inbound message
+                # (#60609).
+                row = db.get_session(session_id) if hasattr(db, "get_session") else None
+                source = (row or {}).get("source", "") if row else ""
+                _GATEWAY_SOURCES = frozenset({
+                    "bluebubbles", "telegram", "discord",
+                    "signal", "whatsapp", "sms",
+                })
+                if source not in _GATEWAY_SOURCES:
+                    db.end_session(session_id, end_reason)
         except Exception:
             pass
 
